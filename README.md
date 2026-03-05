@@ -90,6 +90,19 @@ Corpus size used for time estimates: **50M tokens**
 Training only the expert FFN is ~4× faster and uses ~10× fewer trainable
 parameters than full continued pretraining — with no changes to the base model.
 
+The speedup comes from three compounding effects: no gradients flow through
+the frozen base layers, activations do not need to be stored for the base
+during the forward pass, and the resulting memory reduction allows larger
+batch sizes on the same GPU. The forward pass still runs the full model, so
+the gain is on the backward pass and memory side — ~4× is the realistic
+number once that is accounted for.
+
+> **Note:** Actual throughput depends on batch size tuning, gradient
+> checkpointing settings, and sequence packing efficiency. The ~350k figure
+> assumes the freed memory is recovered via larger batches. Running with
+> default settings carried over from a full-training config may not realise
+> the full gain.
+
 ### inference
 
 Loads the shared expert (base model) and optionally loads a trained expert.
