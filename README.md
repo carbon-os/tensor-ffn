@@ -15,8 +15,8 @@ of the model — not the attention, which handles relationships between tokens.
 
 In this project, an expert is a standalone FFN module trained to store
 knowledge that the shared expert (the base model) does not have. It sits
-alongside the base FFN, outputs a correction delta, and is saved as an
-independent file on disk.
+alongside the base FFN, outputs a correction delta (an additive offset, not
+a replacement), and is saved as an independent file on disk.
 
 ```
 Base FFN (shared expert):   frozen, untouched — general knowledge
@@ -77,6 +77,19 @@ expert FFN receives gradients. The shared expert (base model) is fully
 frozen throughout. On completion the expert weights are saved as a
 standalone .bin file, independent of the base.
 
+#### Speed Table — Single A100 80GB, Qwen 0.5B Base
+
+Corpus size used for time estimates: **50M tokens**
+(reasonable for a focused domain expert like a golang package set)
+
+| Method                   | Trainable Params | Tokens / sec | 50M Token Corpus |
+|--------------------------|------------------|--------------|------------------|
+| Full continued pretrain  | ~500M            | ~90k         | ~9 min           |
+| Your expert FFN only     | ~50M             | ~350k        | ~2.5 min         |
+
+Training only the expert FFN is ~4× faster and uses ~10× fewer trainable
+parameters than full continued pretraining — with no changes to the base model.
+
 ### inference
 
 Loads the shared expert (base model) and optionally loads a trained expert.
@@ -90,13 +103,13 @@ token, always.
 ## Two Modes, No Router
 
 ```
-Mode 1 — shared only:    inference runs the base model alone
+Mode 1 — shared only:     inference runs the base model alone
 Mode 2 — shared + expert: inference adds the expert delta at every layer
 ```
 
 Toggling between modes is the entire test harness. If Mode 2 produces
-correct signatures, accurate import paths, and package-specific patterns
-that Mode 1 gets wrong, the expert has learned real knowledge.
+domain-specific outputs that Mode 1 gets wrong, the expert has learned
+real knowledge.
 
 ---
 
