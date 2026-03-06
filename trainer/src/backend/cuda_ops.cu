@@ -186,11 +186,12 @@ __global__ static void k_rmsnorm_bwd(const float* __restrict__ d_out,
                                       int rows, int dim) {
     int row = blockIdx.x;
     if (row >= rows) return;
-    const float*         dor = d_out + row * dim;
+    const float* dor = d_out + row * dim;
     const __nv_bfloat16* xr  = x     + row * dim;
-    float*               dxr = d_x   + row * dim;
+    float* dxr = d_x   + row * dim;
     float r = rms[row];
 
+    // 1. Compute dot product (Sum of d_out * w * x)
     float dot = 0.0f;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         float wi = __bfloat162float(w[i]);
@@ -204,12 +205,19 @@ __global__ static void k_rmsnorm_bwd(const float* __restrict__ d_out,
         if (threadIdx.x < stride) sdot[threadIdx.x] += sdot[threadIdx.x + stride];
         __syncthreads();
     }
+    
+    // 2. Pre-calculate the subtraction term scaling
+    // sum_term = (Sum * r^2) / N
     float sum_term = sdot[0] * r * r / dim;
 
+    // 3. Compute final gradient
+    // d_x = r * (d_out * w - sum_term * x)
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         float wi = __bfloat162float(w[i]);
         float xi = __bfloat162float(xr[i]);
-        dxr[i]   = r * (dor[i] * wi - sum_term * xi * r * r);
+        
+        // FIXED: Removed the extra (* r * r) that was causing gradient explosion
+        dxr[i]   = r * (dor[i] * wi - sum_term * xi);
     }
 }
 

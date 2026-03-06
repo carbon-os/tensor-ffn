@@ -31,22 +31,20 @@ struct TrainContext {
     AdamWState         opt;
     cublasHandle_t     cublas = nullptr;
 
-    // Batch buffers on device
-    int32_t* d_tokens  = nullptr;  // [B, S]
-    int32_t* d_targets = nullptr;  // [B*S]
-    float*   d_logits  = nullptr;  // [B*S, V]
-    float*   d_dlogits = nullptr;  // [B*S, V]
+    int32_t* d_tokens  = nullptr;
+    int32_t* d_targets = nullptr;
+    float*   d_logits  = nullptr;
+    float*   d_dlogits = nullptr;
 
-    // Activation buffers (reused every step)
-    __nv_bfloat16* h_states     = nullptr;  // [L+1, B*S, H]
-    __nv_bfloat16* ffn_norm_out = nullptr;  // [L, B*S, H]
-    float*          ffn_rms      = nullptr;  // [L, B*S]
-    float*          attn_rms     = nullptr;  // [L, B*S]
-    float*          final_rms    = nullptr;  // [B*S]
-    float*          expert_delta = nullptr;  // [L, B*S, H]
-    float*          d_delta      = nullptr;  // [L, B*S, H]
-    float*          d_xnorm      = nullptr;  // [L, B*S, H]
-    float*          d_h_scratch  = nullptr;  // [B*S, H]
+    __nv_bfloat16* h_states            = nullptr;  // [L+1, B*S, H]
+    __nv_bfloat16* h_after_attn        = nullptr;  // [L,   B*S, H]
+    __nv_bfloat16* ffn_norm_out        = nullptr;  // [L,   B*S, H]  written by pass 2
+    __nv_bfloat16* ffn_norm_out_expert = nullptr;  // [L,   B*S, H]  copy from pass 1
+    float*          ffn_rms      = nullptr;
+    float*          attn_rms     = nullptr;
+    float*          final_rms    = nullptr;
+    float*          expert_delta = nullptr;
+    float*          d_h_scratch  = nullptr;
 
     int batch = 0;
     int seq   = 0;

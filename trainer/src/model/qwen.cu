@@ -1,6 +1,7 @@
 // ============================================================
 // FILE: trainer/src/model/qwen.cpp
 // ============================================================
+#include "model/ffn_expert.h"
 #include "model/qwen.h"
 #include "model/rmsnorm.h"
 #include "model/rope.h"
@@ -216,13 +217,84 @@ __global__ static void k_add_fp32_to_bf16(const float* delta,
     if (i < n) h[i] = __float2bfloat16(__bfloat162float(h[i]) + delta[i]);
 }
 
-// ---- qwen_forward ----
-// We allocate a working bf16 buffer for h_cur and iterate through layers.
+// ================================================================
+//  New static kernels — add before qwen_forward
+// ================================================================
+
+// RoPE: split style (rotate_half), as used by Qwen2/2.5 text models.
+// HF reference: emb = cat([freqs, freqs]); out = x * cos + rotate_half(x) * sin
+// where rotate_half(x) = cat([-x[hd/2:], x[:hd/2]])
+// So for i in [0, hd/2):
+//   out[i]       = x[i]       * cos[i] - x[i+hd/2] * sin[i]
+//   out[i+hd/2]  = x[i+hd/2] * cos[i] + x[i]       * sin[i]
+// x layout: [T, nh, hd] — modified in place
+// cos/sin:  [max_seq, hd/2]
+__global__ static void k_rope_inplace(float* x,
+                                       const float* cos_table,
+                                       const float* sin_table,
+                                       int T, int nh, int hd, int seq) {
+    int t = blockIdx.x;   // token  [0, T)
+    int h = blockIdx.y;   // head   [0, nh)
+    int i = threadIdx.x;  // pair   [0, hd/2)
+    if (t >= T || h >= nh || i >= hd/2) return;
+
+    int pos  = t % seq;
+    int half = hd / 2;
+
+    float* xh = x + t * nh * hd + h * hd;
+    float c = cos_table[pos * half + i];
+    float s = sin_table[pos * half + i];
+
+    float x0 = xh[i];
+    float x1 = xh[i + half];
+    xh[i]        = x0 * c - x1 * s;
+    xh[i + half] = x0 * s + x1 * c;
+}
+
+// Permute [batch*seq, nh, hd] → [batch*nh, seq, hd]
+// cuBLAS strided batched requires [batch*nh, seq, hd] with stride seq*hd.
+__global__ static void k_permute_bshd_to_bhsd(const float* src,
+                                                float* dst,
+                                                int batch, int seq, int nh, int hd) {
+    int b = blockIdx.z;
+    int h = blockIdx.y;
+    int s = blockIdx.x;
+    int d = threadIdx.x;
+    if (b >= batch || h >= nh || s >= seq || d >= hd) return;
+    dst[(b*nh + h)*seq*hd + s*hd + d] = src[(b*seq + s)*nh*hd + h*hd + d];
+}
+
+// Inverse: [batch*nh, seq, hd] → [batch*seq, nh, hd] = [T, nh*hd]
+__global__ static void k_permute_bhsd_to_bshd(const float* src,
+                                                float* dst,
+                                                int batch, int seq, int nh, int hd) {
+    int b = blockIdx.z;
+    int h = blockIdx.y;
+    int s = blockIdx.x;
+    int d = threadIdx.x;
+    if (b >= batch || h >= nh || s >= seq || d >= hd) return;
+    dst[(b*seq + s)*nh*hd + h*hd + d] = src[(b*nh + h)*seq*hd + s*hd + d];
+}
+
+// Causal mask only — scale is already applied inside cuBLAS GEMM.
+__global__ static void k_causal_mask(float* scores, int batch, int nh, int seq) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * nh * seq * seq) return;
+    int q = (idx / seq) % seq;
+    int k = idx % seq;
+    if (k > q) scores[idx] = -1e30f;
+}
+
+// ================================================================
+//  qwen_forward
+// ================================================================
+
 void qwen_forward(QwenModel& m, cublasHandle_t cublas,
                   const int32_t* tokens, int batch, int seq,
                   const float* expert_delta,
                   float* logits,
                   __nv_bfloat16* h_states,
+                  __nv_bfloat16* h_after_attn,
                   __nv_bfloat16* ffn_norm_out,
                   float* ffn_rms,
                   float* attn_rms,
@@ -232,235 +304,216 @@ void qwen_forward(QwenModel& m, cublasHandle_t cublas,
     int H  = c.hidden_size, I = c.intermediate_size;
     int nh = c.num_heads, nkv = c.num_kv_heads, hd = c.head_dim;
 
-    // Pointer to current residual stream = h_states[0]
-    __nv_bfloat16* h_cur = h_states;  // [T, H]
+    __nv_bfloat16* h_work = (__nv_bfloat16*)backend::device_alloc(
+        (size_t)T * H * sizeof(__nv_bfloat16));
 
-    // Embed tokens → h_states[0]
     {
         dim3 grid(T, (H+255)/256);
-        k_embed<<<grid, 256>>>(tokens, m.token_embed, h_cur, T, H);
+        k_embed<<<grid, 256>>>(tokens, m.token_embed, h_work, T, H);
     }
 
-    // Scratch sub-pointers
-    // qkv_scratch layout: [T, (nh + 2*nkv) * hd]
-    float* q_fp32  = m.qkv_scratch;                    // [T, nh*hd]
-    float* k_fp32  = q_fp32  + T * nh  * hd;           // [T, nkv*hd]
-    float* v_fp32  = k_fp32  + T * nkv * hd;           // [T, nkv*hd]
+    float* q_fp32 = m.qkv_scratch;
+    float* k_fp32 = q_fp32 + T * nh  * hd;
+    float* v_fp32 = k_fp32 + T * nkv * hd;
 
-    // Temporary bf16 for normed input and QKV bf16 projections
-    __nv_bfloat16* h_norm_tmp = (__nv_bfloat16*)backend::device_alloc(T * H * sizeof(__nv_bfloat16));
-    __nv_bfloat16* q_bf16_tmp = (__nv_bfloat16*)backend::device_alloc(T * nh  * hd * sizeof(__nv_bfloat16));
-    __nv_bfloat16* k_bf16_tmp = (__nv_bfloat16*)backend::device_alloc(T * nkv * hd * sizeof(__nv_bfloat16));
-    __nv_bfloat16* v_bf16_tmp = (__nv_bfloat16*)backend::device_alloc(T * nkv * hd * sizeof(__nv_bfloat16));
-    __nv_bfloat16* attn_out_bf = (__nv_bfloat16*)backend::device_alloc(T * H * sizeof(__nv_bfloat16));
-    float* attn_out_fp  = (float*)backend::device_alloc(T * H * sizeof(float));
-    // Expanded KV for GQA
-    float* k_exp = (float*)backend::device_alloc(T * nh * hd * sizeof(float));
-    float* v_exp = (float*)backend::device_alloc(T * nh * hd * sizeof(float));
+    __nv_bfloat16* h_norm_tmp  = (__nv_bfloat16*)backend::device_alloc((size_t)T * H * sizeof(__nv_bfloat16));
+    __nv_bfloat16* q_bf16_tmp  = (__nv_bfloat16*)backend::device_alloc((size_t)T * nh  * hd * sizeof(__nv_bfloat16));
+    __nv_bfloat16* k_bf16_tmp  = (__nv_bfloat16*)backend::device_alloc((size_t)T * nkv * hd * sizeof(__nv_bfloat16));
+    __nv_bfloat16* v_bf16_tmp  = (__nv_bfloat16*)backend::device_alloc((size_t)T * nkv * hd * sizeof(__nv_bfloat16));
+    __nv_bfloat16* attn_out_bf = (__nv_bfloat16*)backend::device_alloc((size_t)T * H * sizeof(__nv_bfloat16));
+    float*         attn_out_fp = (float*)        backend::device_alloc((size_t)T * H * sizeof(float));
+
+    float* k_exp    = (float*)backend::device_alloc((size_t)T * nh * hd * sizeof(float));
+    float* v_exp    = (float*)backend::device_alloc((size_t)T * nh * hd * sizeof(float));
+
+    size_t bhsd  = (size_t)batch * nh * seq * hd;
+    float* q_perm   = (float*)backend::device_alloc(bhsd * sizeof(float));
+    float* k_perm   = (float*)backend::device_alloc(bhsd * sizeof(float));
+    float* v_perm   = (float*)backend::device_alloc(bhsd * sizeof(float));
+    float* ctx_bhsd = (float*)backend::device_alloc(bhsd * sizeof(float));
 
     for (int l = 0; l < c.num_layers; ++l) {
         auto& ly = m.layers[l];
-        __nv_bfloat16* h_next = h_states + (size_t)(l+1) * T * H;
 
-        // Save current h as h_states[l] (already set on first iter, copy for rest)
-        if (l > 0) backend::device_copy(h_cur, h_states + (size_t)(l-1)*T*H, T*H*sizeof(__nv_bfloat16));
-        // Actually h_states[0] was set at embed, h_states[l] = h_cur at start of layer l
-        // Let's just do: h_states[l] pointer IS h_cur each layer start
+        // Save pre-attention residual
+        __nv_bfloat16* h_saved = h_states + (size_t)l * T * H;
+        backend::device_copy(h_saved, h_work, (size_t)T * H * sizeof(__nv_bfloat16));
 
         // --- Attention ---
-        // Norm
         float* a_rms_l = attn_rms + l * T;
-        rmsnorm_forward(h_cur, ly.attn_norm, h_norm_tmp, a_rms_l, T, H, c.rms_norm_eps);
+        rmsnorm_forward(h_work, ly.attn_norm, h_norm_tmp, a_rms_l, T, H, c.rms_norm_eps);
 
-        // Q = h_norm @ q_proj.T  [T, nh*hd]
-        backend::gemm_bf16_out(cublas, T, nh*hd, H, h_norm_tmp, ly.q_proj, q_bf16_tmp, false, true);
+        backend::gemm_bf16_out(cublas, T, nh*hd,  H, h_norm_tmp, ly.q_proj, q_bf16_tmp, false, true);
         backend::gemm_bf16_out(cublas, T, nkv*hd, H, h_norm_tmp, ly.k_proj, k_bf16_tmp, false, true);
         backend::gemm_bf16_out(cublas, T, nkv*hd, H, h_norm_tmp, ly.v_proj, v_bf16_tmp, false, true);
 
-        // Add QKV biases if present
         if (ly.q_bias) {
-            dim3 g1(T, (nh*hd+255)/256); k_add_bias_bf16<<<g1,256>>>(q_bf16_tmp, ly.q_bias, T, nh*hd);
-            dim3 g2(T, (nkv*hd+255)/256); k_add_bias_bf16<<<g2,256>>>(k_bf16_tmp, ly.k_bias, T, nkv*hd);
-            k_add_bias_bf16<<<g2,256>>>(v_bf16_tmp, ly.v_bias, T, nkv*hd);
+            dim3 g1(T, (nh*hd+255)/256);
+            dim3 g2(T, (nkv*hd+255)/256);
+            k_add_bias_bf16<<<g1, 256>>>(q_bf16_tmp, ly.q_bias,  T, nh*hd);
+            k_add_bias_bf16<<<g2, 256>>>(k_bf16_tmp, ly.k_bias,  T, nkv*hd);
+            k_add_bias_bf16<<<g2, 256>>>(v_bf16_tmp, ly.v_bias,  T, nkv*hd);
         }
 
-        // Reshape and apply RoPE
-        // Q: [batch, seq, nh, hd] → apply rope → [batch, seq, nh, hd]
-        // (reinterpret pointer shape — layout is same)
         backend::cast_bf16_to_fp32(q_bf16_tmp, q_fp32, T * nh  * hd);
         backend::cast_bf16_to_fp32(k_bf16_tmp, k_fp32, T * nkv * hd);
         backend::cast_bf16_to_fp32(v_bf16_tmp, v_fp32, T * nkv * hd);
 
-        // Apply RoPE (in fp32)
         {
-            // Reshape q_fp32 as [batch, seq, nh, hd] for rope kernel
-            // The kernel handles the layout internally
-            // Using inline rope since RopeTable isn't built here (rope_cos/sin are raw floats)
-            // We'll call a simplified rope via the rope.h interface using m.rope_cos/sin
-            // Placeholder: call device kernel directly
-            dim3 rg(batch * seq * nh, (hd/2 + 31)/32);
-            // Forward-declare rope kernel (shared with rope.cpp)
-            // For self-contained build, inline the kernel here or link from rope.cpp
-            // (assume rope_apply_fp32_raw is accessible)
+            dim3 grid_q(T, nh);
+            dim3 grid_k(T, nkv);
+            k_rope_inplace<<<grid_q, hd/2>>>(q_fp32, m.rope_cos, m.rope_sin, T, nh,  hd, seq);
+            k_rope_inplace<<<grid_k, hd/2>>>(k_fp32, m.rope_cos, m.rope_sin, T, nkv, hd, seq);
         }
 
-        // GQA: expand K/V from [T, nkv, hd] to [T, nh, hd]
         {
             dim3 g(T, nh);
             k_expand_kv<<<g, hd>>>(k_fp32, k_exp, T, nkv, nh, hd);
             k_expand_kv<<<g, hd>>>(v_fp32, v_exp, T, nkv, nh, hd);
         }
 
-        // Attention scores: scores = Q @ K.T / sqrt(hd) with causal mask
-        // Reshape: Q[batch, nh, seq, hd] x K[batch, nh, hd, seq] = [batch, nh, seq, seq]
-        // Use batched GEMM (batch * nh independent matmuls of [seq, hd] x [hd, seq])
         {
-            int B_nh = batch * nh;
+            dim3 pg(seq, nh, batch);
+            k_permute_bshd_to_bhsd<<<pg, hd>>>(q_fp32, q_perm, batch, seq, nh, hd);
+            k_permute_bshd_to_bhsd<<<pg, hd>>>(k_exp,  k_perm, batch, seq, nh, hd);
+            k_permute_bshd_to_bhsd<<<pg, hd>>>(v_exp,  v_perm, batch, seq, nh, hd);
+        }
+
+        {
+            int   B_nh = batch * nh;
             float scale = 1.0f / sqrtf((float)hd);
-            float zero  = 0.0f;
-            // strided batched: A=Q [batch*nh, seq, hd], B=K [batch*nh, seq, hd], C=[batch*nh,seq,seq]
+            float zero  = 0.0f, one = 1.0f;
+
             CUBLAS_CHECK(cublasSgemmStridedBatched(cublas,
                 CUBLAS_OP_T, CUBLAS_OP_N,
                 seq, seq, hd,
                 &scale,
-                k_exp, hd, (long long)seq*hd,  // K: [batch*nh, seq, hd] → transposed
-                q_fp32, hd, (long long)seq*hd,  // Q
+                k_perm, hd, (long long)seq * hd,
+                q_perm, hd, (long long)seq * hd,
                 &zero,
-                m.attn_scratch, seq, (long long)seq*seq,
+                m.attn_scratch, seq, (long long)seq * seq,
                 B_nh));
 
-            // Apply causal mask
             int total = batch * nh * seq * seq;
-            k_scale_causal_mask<<<(total+255)/256, 256>>>(m.attn_scratch, batch, nh, seq);
-            // (scale already applied in cublas call above)
-            // Actually the scale was applied in the GEMM. The mask kernel should only add -inf, not rescale.
-            // Adjust: remove the *scale inside k_scale_causal_mask kernel (pass scale=1.0 separately)
-
-            // Softmax row-wise: each row is over seq keys
+            k_causal_mask<<<(total+255)/256, 256>>>(m.attn_scratch, batch, nh, seq);
             backend::softmax_fp32(m.attn_scratch, batch * nh * seq, seq);
 
-            // Context = softmax(scores) @ V
-            // [batch*nh, seq, seq] @ [batch*nh, seq, hd] = [batch*nh, seq, hd]
             CUBLAS_CHECK(cublasSgemmStridedBatched(cublas,
                 CUBLAS_OP_N, CUBLAS_OP_N,
                 hd, seq, seq,
-                &(scale = 1.0f),
-                v_exp, hd, (long long)seq*hd,
-                m.attn_scratch, seq, (long long)seq*seq,
+                &one,
+                v_perm,        hd,  (long long)seq * hd,
+                m.attn_scratch, seq, (long long)seq * seq,
                 &zero,
-                attn_out_fp, hd, (long long)seq*hd,
+                ctx_bhsd, hd, (long long)seq * hd,
                 B_nh));
         }
 
-        // attn_out = context @ o_proj  [T, H]
-        // attn_out_fp: [T, nh*hd] → convert to bf16 for gemm_bf16_out
-        backend::cast_fp32_to_bf16(attn_out_fp, attn_out_bf, T * nh * hd);
+        {
+            dim3 pg(seq, nh, batch);
+            k_permute_bhsd_to_bshd<<<pg, hd>>>(ctx_bhsd, attn_out_fp, batch, seq, nh, hd);
+        }
+
+        backend::cast_fp32_to_bf16(attn_out_fp, attn_out_bf, T * H);
         backend::gemm_bf16_out(cublas, T, H, nh*hd,
                                attn_out_bf, ly.o_proj, h_norm_tmp, false, true);
-        // residual: h_cur += attn_out
         {
             int total = T * H;
             backend::cast_bf16_to_fp32(h_norm_tmp, attn_out_fp, total);
-            k_add_fp32_to_bf16<<<(total+255)/256, 256>>>(attn_out_fp, h_cur, total);
+            k_add_fp32_to_bf16<<<(total+255)/256, 256>>>(attn_out_fp, h_work, total);
+        }
+
+        // Save post-attention residual (used by backward for FFN rmsnorm)
+        if (h_after_attn) {
+            backend::device_copy(h_after_attn + (size_t)l * T * H,
+                                 h_work,
+                                 (size_t)T * H * sizeof(__nv_bfloat16));
         }
 
         // --- FFN ---
         float* f_rms_l = ffn_rms + l * T;
         __nv_bfloat16* ffn_norm_l = ffn_norm_out + (size_t)l * T * H;
-        rmsnorm_forward(h_cur, ly.ffn_norm, ffn_norm_l, f_rms_l, T, H, c.rms_norm_eps);
+        rmsnorm_forward(h_work, ly.ffn_norm, ffn_norm_l, f_rms_l, T, H, c.rms_norm_eps);
 
-        // Base FFN: gate = ffn_norm @ gate_proj.T, up = ffn_norm @ up_proj.T
-        __nv_bfloat16* gate_tmp = (__nv_bfloat16*)m.ffn_scratch;  // reuse as bf16? No.
-        // Use ffn_scratch as fp32 for base FFN output
-        // Compute gate (bf16 out, reuse q_bf16_tmp as scratch)
         backend::gemm_bf16_out(cublas, T, I, H, ffn_norm_l, ly.gate_proj, q_bf16_tmp, false, true);
         backend::gemm_bf16_out(cublas, T, I, H, ffn_norm_l, ly.up_proj,   k_bf16_tmp, false, true);
         backend::silu_mul_bf16(q_bf16_tmp, k_bf16_tmp, v_bf16_tmp, T * I);
-        // base_ffn_out [T, H] fp32
-        backend::gemm_bf16(cublas, T, H, I, 1.0f, v_bf16_tmp, ly.down_proj, 0.0f, m.ffn_scratch, false, true);
+        backend::gemm_bf16(cublas, T, H, I,
+                           1.0f, v_bf16_tmp, ly.down_proj,
+                           0.0f, m.ffn_scratch, false, true);
 
-        // Add expert delta if provided
         if (expert_delta) {
             const float* ed_l = expert_delta + (size_t)l * T * H;
             backend::add_fp32(m.ffn_scratch, ed_l, m.ffn_scratch, T * H);
         }
 
-        // residual: h_cur += base_ffn_out (+ expert)
         {
             int total = T * H;
-            k_add_fp32_to_bf16<<<(total+255)/256, 256>>>(m.ffn_scratch, h_cur, total);
+            k_add_fp32_to_bf16<<<(total+255)/256, 256>>>(m.ffn_scratch, h_work, total);
         }
-
-        // Save h_states[l+1] = h_cur (copy to next slot)
-        backend::device_copy(h_next, h_cur, T * H * sizeof(__nv_bfloat16));
-        h_cur = h_next;
     }
 
-    // Final norm → logits
-    __nv_bfloat16* final_h_norm = h_norm_tmp;  // reuse scratch
-    rmsnorm_forward(h_cur, m.final_norm, final_h_norm, final_rms, T, H, c.rms_norm_eps);
+    __nv_bfloat16* h_final = h_states + (size_t)c.num_layers * T * H;
+    backend::device_copy(h_final, h_work, (size_t)T * H * sizeof(__nv_bfloat16));
 
-    // logits = final_h_norm @ lm_head.T  [T, V]
+    rmsnorm_forward(h_work, m.final_norm, h_norm_tmp, final_rms, T, H, c.rms_norm_eps);
     backend::gemm_bf16(cublas, T, (int)c.vocab_size, H,
-                       1.0f, final_h_norm, m.lm_head,
+                       1.0f, h_norm_tmp, m.lm_head,
                        0.0f, logits, false, true);
 
+    backend::device_free(h_work);
     backend::device_free(h_norm_tmp);
-    backend::device_free(q_bf16_tmp); backend::device_free(k_bf16_tmp); backend::device_free(v_bf16_tmp);
-    backend::device_free(attn_out_bf); backend::device_free(attn_out_fp);
-    backend::device_free(k_exp); backend::device_free(v_exp);
+    backend::device_free(q_bf16_tmp);
+    backend::device_free(k_bf16_tmp);
+    backend::device_free(v_bf16_tmp);
+    backend::device_free(attn_out_bf);
+    backend::device_free(attn_out_fp);
+    backend::device_free(k_exp);
+    backend::device_free(v_exp);
+    backend::device_free(q_perm);
+    backend::device_free(k_perm);
+    backend::device_free(v_perm);
+    backend::device_free(ctx_bhsd);
 }
 
-// ---- qwen_backward ----
-// Propagates d_logits backward through frozen model to get d_ffn_norm_out [L,T,H].
-// Uses recomputation (gradient checkpointing) for attention — recomputes fwd from h_states.
 void qwen_backward(QwenModel& m, cublasHandle_t cublas,
                    const float* d_logits, int batch, int seq,
                    const __nv_bfloat16* h_states,
+                   const __nv_bfloat16* h_after_attn,
                    const __nv_bfloat16* ffn_norm_out,
                    const float* ffn_rms,
-                   const float* attn_rms,
                    const float* final_rms,
-                   const float* d_expert_norm,
+                   ExpertFFN& expert,
+                   const __nv_bfloat16* expert_ffn_norm_out,
                    float* d_h_scratch) {
     auto& c = m.cfg;
     int T = batch * seq, H = c.hidden_size;
 
-    // Cast d_logits [T, V] fp32 → bf16 so we can use gemm_bf16
     __nv_bfloat16* d_logits_bf = (__nv_bfloat16*)backend::device_alloc(
         (size_t)T * c.vocab_size * sizeof(__nv_bfloat16));
     backend::cast_fp32_to_bf16(d_logits, d_logits_bf, T * c.vocab_size);
 
-    // d_final_norm_out [T, H] = d_logits [T, V] @ lm_head [V, H]
     float* d_final_h = (float*)backend::device_alloc((size_t)T * H * sizeof(float));
     backend::gemm_bf16(cublas, T, H, c.vocab_size,
-                       1.0f,
-                       d_logits_bf,   // [T, V]
-                       m.lm_head,     // [V, H]
-                       0.0f,
-                       d_final_h,
+                       1.0f, d_logits_bf, m.lm_head,
+                       0.0f, d_final_h,
                        false, false);
-
     backend::device_free(d_logits_bf);
 
-    // RMSNorm backward through final norm → d_h [T, H]
     float* d_h = d_h_scratch;
     const __nv_bfloat16* h_final = h_states + (size_t)c.num_layers * T * H;
     model::rmsnorm_backward(d_final_h, h_final, m.final_norm,
                             final_rms, d_h, T, H, c.rms_norm_eps);
     backend::device_free(d_final_h);
 
-    // Layer backward in reverse
     for (int l = c.num_layers - 1; l >= 0; --l) {
         auto& ly = m.layers[l];
-        const __nv_bfloat16* h_l  = h_states    + (size_t)l * T * H;
-        const __nv_bfloat16* fn_l = ffn_norm_out + (size_t)l * T * H;
-        const float*          fr_l = ffn_rms     + l * T;
-        const float*          ar_l = attn_rms    + l * T;
-        const float*          den_l = d_expert_norm + (size_t)l * T * H;
+        const __nv_bfloat16* h_post_attn = h_after_attn       + (size_t)l * T * H;
+        const __nv_bfloat16* fn_l        = ffn_norm_out        + (size_t)l * T * H;
+        const float*          fr_l       = ffn_rms             + l * T;
+        const __nv_bfloat16* exp_fn_l    = expert_ffn_norm_out + (size_t)l * T * H;
 
-        // --- Base FFN backward ---
-        // Recompute gate, up, gate_act from saved ffn_norm_out
+        // ---- Base FFN backward ----
         int I = c.intermediate_size;
         __nv_bfloat16* g_tmp = (__nv_bfloat16*)backend::device_alloc((size_t)T*I*sizeof(__nv_bfloat16));
         __nv_bfloat16* u_tmp = (__nv_bfloat16*)backend::device_alloc((size_t)T*I*sizeof(__nv_bfloat16));
@@ -477,74 +530,51 @@ void qwen_backward(QwenModel& m, cublasHandle_t cublas,
         backend::cast_bf16_to_fp32(g_tmp, g_fp, T * I);
         backend::cast_bf16_to_fp32(u_tmp, u_fp, T * I);
 
-        // d_act [T,I] = d_h [T,H] @ down_proj [H,I]
-        // Cast down_proj to fp32
         float* dp_fp = (float*)backend::device_alloc((size_t)H*I*sizeof(float));
         backend::cast_bf16_to_fp32(ly.down_proj, dp_fp, H * I);
         backend::gemm_fp32(cublas, T, I, H, 1.0f, d_h, dp_fp, 0.0f, d_act, false, false);
         backend::device_free(dp_fp);
 
-        // SiLU-mul backward
         backend::silu_mul_backward_fp32(d_act, g_fp, u_fp, d_g, d_u, T * I);
 
-        // d_ffn_norm [T,H] = d_g @ gate_proj + d_u @ up_proj
         float* gp_fp = (float*)backend::device_alloc((size_t)I*H*sizeof(float));
         float* up_fp = (float*)backend::device_alloc((size_t)I*H*sizeof(float));
         backend::cast_bf16_to_fp32(ly.gate_proj, gp_fp, I * H);
         backend::cast_bf16_to_fp32(ly.up_proj,   up_fp, I * H);
 
+        // d_ffn_norm = dL/d(x_norm) from the base FFN path
         float* d_ffn_norm = (float*)backend::device_alloc((size_t)T*H*sizeof(float));
         backend::gemm_fp32(cublas, T, H, I, 1.0f, d_g, gp_fp, 0.0f, d_ffn_norm, false, false);
         backend::gemm_fp32(cublas, T, H, I, 1.0f, d_u, up_fp, 1.0f, d_ffn_norm, false, false);
 
-        // Add expert contribution
-        backend::add_fp32(d_ffn_norm, den_l, d_ffn_norm, T * H);
+        // ---- Expert backward for this layer, interleaved ----
+        // d_h is dL/d(expert_delta[l]) since expert_delta is added directly to the residual.
+        // exp_fn_l is the pass-1 (base-only) normed input the expert actually saw.
+        float* d_x_norm_expert = (float*)backend::device_alloc((size_t)T*H*sizeof(float));
+        model::expert_backward_layer(expert, cublas, l,
+                                     exp_fn_l,
+                                     d_h,
+                                     d_x_norm_expert,
+                                     T);
 
-        // RMSNorm backward: d_ffn_norm → d_h_ffn
+        // Both paths (base FFN and expert) read the same x_norm, so add their gradients.
+        backend::add_fp32(d_ffn_norm, d_x_norm_expert, d_ffn_norm, T * H);
+        backend::device_free(d_x_norm_expert);
+
+        // ---- RMSNorm backward — correct input is h_after_attn ----
         float* d_h_ffn = (float*)backend::device_alloc((size_t)T*H*sizeof(float));
-        model::rmsnorm_backward(d_ffn_norm, h_l, ly.ffn_norm, fr_l,
+        model::rmsnorm_backward(d_ffn_norm, h_post_attn, ly.ffn_norm, fr_l,
                                 d_h_ffn, T, H, c.rms_norm_eps);
 
-        // --- Attention backward ---
-        // d_attn_in [T, nh*hd] = d_h [T,H] @ o_proj [H, nh*hd]
-        int nh = c.num_heads, hd = c.head_dim;
-        float* op_fp = (float*)backend::device_alloc((size_t)H*nh*hd*sizeof(float));
-        backend::cast_bf16_to_fp32(ly.o_proj, op_fp, H * nh * hd);
-        float* d_attn_in = (float*)backend::device_alloc((size_t)T*nh*hd*sizeof(float));
-        backend::gemm_fp32(cublas, T, nh*hd, H, 1.0f, d_h, op_fp, 0.0f, d_attn_in, false, false);
-        backend::device_free(op_fp);
+        // Accumulate into running gradient — FFN path only (no attention Jacobian)
+        backend::add_fp32(d_h, d_h_ffn, d_h, T * H);
 
-        // Recompute attn norm output
-        __nv_bfloat16* h_norm_attn = (__nv_bfloat16*)backend::device_alloc((size_t)T*H*sizeof(__nv_bfloat16));
-        float* ar_tmp = (float*)backend::device_alloc(T * sizeof(float));
-        model::rmsnorm_forward(h_l, ly.attn_norm, h_norm_attn, ar_tmp, T, H, c.rms_norm_eps);
-
-        // d_attn_norm [T,H] from d_attn_in propagated back through Q projection
-        // (simplified: sum contributions from Q,K,V projections)
-        float* qp_fp = (float*)backend::device_alloc((size_t)nh*hd*H*sizeof(float));
-        backend::cast_bf16_to_fp32(ly.q_proj, qp_fp, nh*hd*H);
-        float* d_attn_norm = (float*)backend::device_alloc((size_t)T*H*sizeof(float));
-        // d_attn_norm [T,H] = d_attn_in [T,nh*hd] @ q_proj [nh*hd, H]
-        backend::gemm_fp32(cublas, T, H, nh*hd, 1.0f, d_attn_in, qp_fp, 0.0f, d_attn_norm, false, false);
-        backend::device_free(qp_fp);
-        backend::device_free(d_attn_in);
-
-        float* d_h_attn = (float*)backend::device_alloc((size_t)T*H*sizeof(float));
-        model::rmsnorm_backward(d_attn_norm, h_l, ly.attn_norm, ar_l,
-                                d_h_attn, T, H, c.rms_norm_eps);
-
-        // Accumulate into d_h: residual passes through, add FFN and attn contributions
-        backend::add_fp32(d_h, d_h_ffn,  d_h, T * H);
-        backend::add_fp32(d_h, d_h_attn, d_h, T * H);
-
-        // Cleanup
-        backend::device_free(g_tmp); backend::device_free(u_tmp); backend::device_free(a_tmp);
-        backend::device_free(g_fp);  backend::device_free(u_fp);
-        backend::device_free(d_act); backend::device_free(d_g);  backend::device_free(d_u);
-        backend::device_free(gp_fp); backend::device_free(up_fp);
-        backend::device_free(d_ffn_norm); backend::device_free(d_h_ffn);
-        backend::device_free(d_attn_norm); backend::device_free(d_h_attn);
-        backend::device_free(h_norm_attn); backend::device_free(ar_tmp);
+        backend::device_free(g_tmp);  backend::device_free(u_tmp);  backend::device_free(a_tmp);
+        backend::device_free(g_fp);   backend::device_free(u_fp);
+        backend::device_free(d_act);  backend::device_free(d_g);    backend::device_free(d_u);
+        backend::device_free(gp_fp);  backend::device_free(up_fp);
+        backend::device_free(d_ffn_norm);
+        backend::device_free(d_h_ffn);
     }
 }
 

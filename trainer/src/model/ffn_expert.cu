@@ -99,10 +99,14 @@ __global__ static void k_xavier_init(float* w, int n, float scale, unsigned seed
 
 void expert_init_weights(ExpertFFN& e, unsigned long seed) {
     int H = e.hidden_size, I = e.intermediate_size;
-    // Xavier scale for gate/up: fan_in = H, fan_out = I
-    float scale_gate = sqrtf(6.0f / (H + I));
-    // Xavier scale for down: fan_in = I, fan_out = H
-    float scale_down = sqrtf(6.0f / (I + H));
+
+    // gate/up: Xavier uniform — these project input into intermediate space
+    float scale_gate = sqrtf(6.0f / (float)(H + I));
+
+    // down_proj: zero init — expert starts as a no-op delta
+    // The branch output is expert_delta = gate_act @ down_proj.T
+    // Zero down_proj → zero delta → base model runs unmodified at step 0
+    // The optimizer will grow down_proj from zero as needed
 
     for (int l = 0; l < e.num_layers; ++l) {
         auto& el = e.layers[l];
@@ -110,17 +114,30 @@ void expert_init_weights(ExpertFFN& e, unsigned long seed) {
         size_t d  = (size_t)H * I;
         unsigned ls = (unsigned)(seed + l * 3);
 
+        // gate_proj and up_proj: Xavier uniform (unchanged)
         k_xavier_init<<<(gu+255)/256, 256>>>(el.gate_proj_fp32, (int)gu, scale_gate, ls);
         k_xavier_init<<<(gu+255)/256, 256>>>(el.up_proj_fp32,   (int)gu, scale_gate, ls+1);
-        k_xavier_init<<<(d +255)/256, 256>>>(el.down_proj_fp32, (int)d,  scale_down, ls+2);
 
-        // cast to bf16
+        // down_proj: zero
+        backend::device_memset(el.down_proj_fp32, 0, d * sizeof(float));
+
+        // Zero the fp32 master moments too (already done in expert_alloc,
+        // but be explicit since init order matters)
+        backend::device_memset(el.gate_m1, 0, gu * sizeof(float));
+        backend::device_memset(el.gate_m2, 0, gu * sizeof(float));
+        backend::device_memset(el.up_m1,   0, gu * sizeof(float));
+        backend::device_memset(el.up_m2,   0, gu * sizeof(float));
+        backend::device_memset(el.down_m1, 0, d  * sizeof(float));
+        backend::device_memset(el.down_m2, 0, d  * sizeof(float));
+
+        // Cast to bf16
         backend::cast_fp32_to_bf16(el.gate_proj_fp32, el.gate_proj, (int)gu);
         backend::cast_fp32_to_bf16(el.up_proj_fp32,   el.up_proj,   (int)gu);
         backend::cast_fp32_to_bf16(el.down_proj_fp32, el.down_proj, (int)d);
     }
     cudaDeviceSynchronize();
 }
+
 
 void expert_zero_grad(ExpertFFN& e) {
     for (int l = 0; l < e.num_layers; ++l) {
@@ -141,135 +158,116 @@ void expert_forward(ExpertFFN& e, cublasHandle_t cublas,
                     float* out_delta,
                     int batch_tokens) {
     int H = e.hidden_size, I = e.intermediate_size;
-    size_t layer_x_bytes   = (size_t)batch_tokens * H;
-    size_t layer_out_bytes = (size_t)batch_tokens * H;
-
-    for (int l = 0; l < e.num_layers; ++l) {
-        auto& el = e.layers[l];
-        const __nv_bfloat16* x_l = x_norm_per_layer + l * layer_x_bytes;
-        float* delta_l           = out_delta         + l * layer_out_bytes;
-
-        // gate = x @ gate_proj.T → [T, I]  (stored in gate_buf)
-        backend::gemm_bf16_out(cublas, batch_tokens, I, H,
-                               x_l, el.gate_proj, e.gate_buf,
-                               false, true);
-
-        // up = x @ up_proj.T → [T, I]
-        backend::gemm_bf16_out(cublas, batch_tokens, I, H,
-                               x_l, el.up_proj, e.up_buf,
-                               false, true);
-
-        // gate_act = silu(gate) * up  → [T, I]
-        backend::silu_mul_bf16(e.gate_buf, e.up_buf, e.gate_act, batch_tokens * I);
-
-        // delta = gate_act @ down_proj.T → [T, H]  fp32
-        backend::gemm_bf16(cublas, batch_tokens, H, I,
-                           1.0f, e.gate_act, el.down_proj,
-                           0.0f, delta_l,
-                           false, true);
-    }
-}
-
-// Backward: accumulate weight grads, compute d_x_norm
-// d_delta: [L, T, H]  fp32  (upstream gradient)
-// d_x_norm: [L, T, H] fp32  (output: gradient w.r.t. expert normed input)
-void expert_backward(ExpertFFN& e, cublasHandle_t cublas,
-                     const __nv_bfloat16* x_norm_per_layer,
-                     const float* d_delta,
-                     float* d_x_norm,
-                     int batch_tokens) {
-    int H = e.hidden_size, I = e.intermediate_size;
     size_t layer_x   = (size_t)batch_tokens * H;
-    size_t layer_act = (size_t)batch_tokens * I;
+    size_t layer_out = (size_t)batch_tokens * H;
 
     for (int l = 0; l < e.num_layers; ++l) {
         auto& el = e.layers[l];
         const __nv_bfloat16* x_l    = x_norm_per_layer + l * layer_x;
-        const float* dd_l           = d_delta           + l * layer_x;
-        float* dxn_l                = d_x_norm          + l * layer_x;
+        float*               delta_l = out_delta        + l * layer_out;
 
-        // Recompute forward activations (gradient checkpointing style)
         backend::gemm_bf16_out(cublas, batch_tokens, I, H,
                                x_l, el.gate_proj, e.gate_buf, false, true);
         backend::gemm_bf16_out(cublas, batch_tokens, I, H,
                                x_l, el.up_proj, e.up_buf, false, true);
         backend::silu_mul_bf16(e.gate_buf, e.up_buf, e.gate_act, batch_tokens * I);
+        backend::gemm_bf16(cublas, batch_tokens, H, I,
+                           1.0f, e.gate_act, el.down_proj,
+                           0.0f, delta_l, false, true);
 
-        // Need fp32 versions of gate_buf and up_buf for the silu backward
-        // Reuse d_gate_buf and d_up_buf temporarily as storage (overwrite below)
-        backend::cast_bf16_to_fp32(e.gate_buf, e.d_gate_buf, batch_tokens * I);
-        backend::cast_bf16_to_fp32(e.up_buf,   e.d_up_buf,   batch_tokens * I);
+        backend::scale_fp32(delta_l, kExpertOutputScale, batch_tokens * H);
+    }
+}
 
-        // d_gate_act = d_delta @ down_proj → [T, I]  fp32
-        // down_proj: [H, I], d_delta: [T, H]
-        backend::gemm_fp32(cublas, batch_tokens, I, H,
-                           1.0f, dd_l, el.down_proj_fp32,
-                           0.0f, e.d_act_buf,
-                           false, false);   // down_proj_fp32 is [H,I], need [I,H] → transA=true
-        // Wait — down_proj shape is [H, I]: hidden × intermediate
-        // d_gate_act [T, I] = d_delta [T, H] @ down_proj [H, I]
-        // That's correct with transA=false, transB=false since down_proj [H,I] means rows=H, cols=I
-        // Re-check: gemm_fp32(M, N, K, A[M,K], B[K,N]) → C[M,N]
-        // We want [T, I] = [T, H] @ [H, I]: M=T, N=I, K=H. A=[T,H], B=[H,I]. Correct as above.
+void expert_backward_layer(ExpertFFN& e, cublasHandle_t cublas,
+                            int layer,
+                            const __nv_bfloat16* x_norm_l,
+                            const float* d_delta_l,
+                            float* d_x_norm_l,
+                            int batch_tokens) {
+    auto& el = e.layers[layer];
+    int H = e.hidden_size, I = e.intermediate_size;
 
-        // Accumulate d_down_proj += gate_act.T @ d_delta → [I, T] @ [T, H] = [I, H]
-        // down_proj_grad: [H, I], so we need gate_act[T,I].T @ d_delta[T,H] → [I, H]
-        // That's transA=true for gate_act. We use fp32 gate_act from d_act_buf recomputed
-        // Actually we need gate_act in fp32. Let's cast from e.gate_act (bf16):
-        // We already have e.d_act_buf used for d_gate_act. Use d_gate_buf as temp fp32 gate_act.
-        backend::cast_bf16_to_fp32(e.gate_act, e.d_gate_buf, batch_tokens * I);  // fp32 gate_act
+    // Backward through the output scale
+    float* dd_scaled = (float*)backend::device_alloc(
+        (size_t)batch_tokens * H * sizeof(float));
+    backend::device_copy(dd_scaled, d_delta_l,
+                         (size_t)batch_tokens * H * sizeof(float));
+    backend::scale_fp32(dd_scaled, kExpertOutputScale, batch_tokens * H);
 
-        // d_down_proj += gate_act.T @ d_delta  (shape: [I,T]@[T,H] = [I,H] but we store [H,I])
-        // Store as [H,I]: we need (d_delta.T @ gate_act) = [H,T]@[T,I] = [H,I]
-        backend::gemm_fp32(cublas, H, I, batch_tokens,
-                           1.0f, dd_l, e.d_gate_buf,   // d_delta[T,H].T → A=[H,T]? No.
-                           1.0f, el.down_grad,
-                           true, false);
-        // Hmm: gemm_fp32 with transA=true means A is [K,M] stored → produces M×N from K×M × K×N
-        // We want [H,I] += [H,T] @ [T,I]
-        // With transA=true: A is passed as [T,H] → treated as [H,T]. N=I, K=T, M=H.
-        // B=[T,I], transB=false. So: M=H, N=I, K=T, A=[T,H] transposed, B=[T,I] → correct.
+    // Recompute forward activations
+    backend::gemm_bf16_out(cublas, batch_tokens, I, H,
+                           x_norm_l, el.gate_proj, e.gate_buf, false, true);
+    backend::gemm_bf16_out(cublas, batch_tokens, I, H,
+                           x_norm_l, el.up_proj, e.up_buf, false, true);
+    backend::silu_mul_bf16(e.gate_buf, e.up_buf, e.gate_act, batch_tokens * I);
 
-        // SiLU-mul backward: produces d_gate and d_up (both [T, I], fp32)
-        // d_gate_buf was overwritten; recover gate fp32 in d_up_buf (it was there)
-        // Actually we used d_gate_buf for fp32 gate_act. We need gate (pre-silu) fp32.
-        // It's in e.d_up_buf (set just before), let's rename mentally:
-        //   e.d_gate_buf now = fp32 gate_act
-        //   e.d_up_buf  now = fp32 gate (pre-silu)   [set above as cast of gate_buf]
-        // e.d_act_buf now   = d_gate_act (gradient into gate_act)
-        // Now compute silu_mul backward:
-        // d_gate, d_up → store into e.d_gate_buf, e.d_up_buf (overwrite fp32 gate_act with d_gate)
-        backend::silu_mul_backward_fp32(e.d_act_buf,   // d_gate_act
-                                        e.d_up_buf,    // gate fp32 (pre-silu)
-                                        /* up fp32 */ nullptr, // BUG: need up_fp32
-                                        e.d_gate_buf,  // d_gate output
-                                        e.d_up_buf,    // d_up output (overwrites gate fp32)
-                                        batch_tokens * I);
-        // NOTE: silu_mul_backward_fp32 needs fp32 up as well. We lost it.
-        // Fix: save fp32 up before overwriting. Use d_act_buf as temp after d_gate_act is read.
-        // Restructured approach: see corrected version below (separate temp buffer needed).
-        // For correctness, we'll use a separate fp32 temp for up. Allocated below.
+    backend::cast_bf16_to_fp32(e.gate_buf, e.d_gate_buf, batch_tokens * I);
+    backend::cast_bf16_to_fp32(e.up_buf,   e.d_up_buf,   batch_tokens * I);
 
-        // Accumulate d_gate_proj += d_gate.T @ x_l → [I,T]@[T,H] = [I,H]
-        // Stored as [I,H]: M=I, N=H, K=T, A=d_gate[T,I] transposed, B=x_l[T,H] bf16→need fp32
-        // (use gemm with bf16 x_l)
-        backend::gemm_fp32(cublas, I, H, batch_tokens,
-                           1.0f, e.d_gate_buf, nullptr /* x_fp32 needed */,
-                           1.0f, el.gate_grad,
-                           true, false);
-        // Similar for d_up_proj
+    float* x_fp32 = (float*)backend::device_alloc(
+        (size_t)batch_tokens * H * sizeof(float));
+    backend::cast_bf16_to_fp32(x_norm_l, x_fp32, batch_tokens * H);
 
-        // d_x_norm[l] = d_gate @ gate_proj + d_up @ up_proj
-        // d_gate [T,I] @ gate_proj [I,H] → [T,H]
-        backend::gemm_fp32(cublas, batch_tokens, H, I,
-                           1.0f, e.d_gate_buf, el.gate_proj_fp32,
-                           0.0f, dxn_l,
-                           false, false);
-        // += d_up [T,I] @ up_proj [I,H]
-        backend::gemm_fp32(cublas, batch_tokens, H, I,
-                           1.0f, e.d_up_buf, el.up_proj_fp32,
-                           1.0f, dxn_l,
-                           false, false);
+    // d_down_grad += gate_act.T @ dd_scaled
+    backend::cast_bf16_to_fp32(e.gate_act, e.d_act_buf, batch_tokens * I);
+    backend::gemm_fp32(cublas, H, I, batch_tokens,
+                       1.0f, dd_scaled, e.d_act_buf,
+                       1.0f, el.down_grad,
+                       true, false);
+
+    // d_gate_act = dd_scaled @ down_proj_fp32
+    backend::gemm_fp32(cublas, batch_tokens, I, H,
+                       1.0f, dd_scaled, el.down_proj_fp32,
+                       0.0f, e.d_act_buf,
+                       false, false);
+
+    // SiLU-mul backward
+    backend::silu_mul_backward_fp32(e.d_act_buf,
+                                    e.d_gate_buf,
+                                    e.d_up_buf,
+                                    e.d_gate_buf,
+                                    e.d_up_buf,
+                                    batch_tokens * I);
+
+    // Weight gradients
+    backend::gemm_fp32(cublas, I, H, batch_tokens,
+                       1.0f, e.d_gate_buf, x_fp32,
+                       1.0f, el.gate_grad,
+                       true, false);
+    backend::gemm_fp32(cublas, I, H, batch_tokens,
+                       1.0f, e.d_up_buf, x_fp32,
+                       1.0f, el.up_grad,
+                       true, false);
+
+    // d_x_norm
+    backend::gemm_fp32(cublas, batch_tokens, H, I,
+                       1.0f, e.d_gate_buf, el.gate_proj_fp32,
+                       0.0f, d_x_norm_l,
+                       false, false);
+    backend::gemm_fp32(cublas, batch_tokens, H, I,
+                       1.0f, e.d_up_buf, el.up_proj_fp32,
+                       1.0f, d_x_norm_l,
+                       false, false);
+
+    backend::device_free(dd_scaled);
+    backend::device_free(x_fp32);
+}
+
+
+void expert_backward(ExpertFFN& e, cublasHandle_t cublas,
+                     const __nv_bfloat16* x_norm_per_layer,
+                     const float* d_delta,
+                     float* d_x_norm,
+                     int batch_tokens) {
+    int H = e.hidden_size;
+    size_t layer_stride = (size_t)batch_tokens * H;
+    for (int l = 0; l < e.num_layers; ++l) {
+        expert_backward_layer(e, cublas, l,
+                              x_norm_per_layer + l * layer_stride,
+                              d_delta          + l * layer_stride,
+                              d_x_norm         + l * layer_stride,
+                              batch_tokens);
     }
 }
 

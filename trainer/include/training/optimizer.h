@@ -7,12 +7,12 @@
 namespace training {
 
 struct AdamWConfig {
-    float lr          = 3e-4f;
-    float beta1       = 0.9f;
-    float beta2       = 0.999f;
-    float eps         = 1e-8f;
+    float lr           = 3e-4f;
+    float beta1        = 0.9f;
+    float beta2        = 0.999f;
+    float eps          = 1e-8f;
     float weight_decay = 0.1f;
-    float grad_clip   = 1.0f;
+    float grad_clip    = 100.0f;   // was 1.0 — 1.0 is too tight for a cold expert
 };
 
 struct AdamWState {

@@ -54,8 +54,13 @@ The binary lands at `build/tensor-ffn`.
 export CUDA_LAUNCH_BLOCKING=1
 export CUBLAS_LOGDEST_DBG=stdout
 export CUBLAS_LOGINFO_DBG=1
-export CUDA_LAUNCH_BLOCKING=1
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
+unset CUDA_LAUNCH_BLOCKING
+unset CUBLAS_LOGDEST_DBG
+unset CUBLAS_LOGINFO_DBG
+unset CUBLAS_WORKSPACE_CONFIG
+
 nvidia-smi --query-gpu=name,compute_cap --format=csv
 
 # Tokenize
