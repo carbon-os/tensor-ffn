@@ -4,6 +4,7 @@
 #include "io/checkpoint.h"
 #include "model/ffn_expert.h"
 #include "backend/memory.h"
+#include "backend/cuda_ops.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

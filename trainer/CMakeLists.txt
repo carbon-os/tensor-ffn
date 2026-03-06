@@ -1,30 +1,34 @@
 cmake_minimum_required(VERSION 3.22)
-project(tensor-ffn-trainer LANGUAGES CXX CUDA)
+
+set(CMAKE_TOOLCHAIN_FILE "${CMAKE_SOURCE_DIR}/vcpkg/scripts/buildsystems/vcpkg.cmake"
+    CACHE STRING "")
+
+project(tensor-ffn LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_ARCHITECTURES 80)   # A100; change to 86 for A10/3090
+set(CMAKE_CUDA_ARCHITECTURES 70 75 80 86 89 90)
 
 find_package(CUDAToolkit REQUIRED)
-find_package(nlohmann_json REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
 
-include_directories(trainer/include)
+include_directories(include)
 
 set(SOURCES
-    trainer/src/main.cpp
-    trainer/src/backend/memory.cpp
-    trainer/src/backend/cuda_ops.cu
-    trainer/src/model/rmsnorm.cpp
-    trainer/src/model/rope.cpp
-    trainer/src/model/ffn_expert.cpp
-    trainer/src/model/qwen.cpp
-    trainer/src/io/safetensors.cpp
-    trainer/src/io/tokenizer.cpp
-    trainer/src/io/corpus.cpp
-    trainer/src/io/checkpoint.cpp
-    trainer/src/training/loss.cpp
-    trainer/src/training/optimizer.cpp
-    trainer/src/training/trainer.cpp
+    src/main.cpp
+    src/backend/memory.cpp
+    src/backend/cuda_ops.cu
+    src/model/rmsnorm.cpp
+    src/model/rope.cpp
+    src/model/ffn_expert.cu
+    src/model/qwen.cu
+    src/io/safetensors.cpp
+    src/io/tokenizer.cpp
+    src/io/corpus.cpp
+    src/io/checkpoint.cpp
+    src/training/loss.cu
+    src/training/optimizer.cu
+    src/training/trainer.cpp
 )
 
 add_executable(tensor-ffn ${SOURCES})

@@ -1,11 +1,7 @@
-// ============================================================
-// FILE: trainer/include/io/corpus.h
-// ============================================================
 #pragma once
 #include <string>
 #include <vector>
 #include <cstdint>
-#include <fstream>
 
 namespace io {
 
@@ -27,7 +23,7 @@ struct CorpusLoader {
     void*    mmap_ptr   = nullptr;
     size_t   mmap_size  = 0;
     uint64_t num_tokens = 0;
-    const uint32_t* token_ptr = nullptr;  // points into mmap
+    const uint32_t* token_ptr = nullptr;
 
     void open(const std::string& path);
     void close();
@@ -36,16 +32,20 @@ struct CorpusLoader {
     uint64_t total_tokens() const { return num_tokens; }
 
     // Fill input/target buffers with one batch.
-    // Windows are non-overlapping and packed; wraps around at end of corpus.
     // input:  [batch, seq]  uint32 on host
-    // target: [batch, seq]  uint32 on host  (shifted by 1: target[t] = input[t+1])
-    // offset: starting token index into corpus (advances by batch*seq each call)
-    // Returns false when corpus is exhausted (offset >= num_tokens - seq).
+    // target: [batch, seq]  uint32 on host  (target[t] = input[t+1])
+    // offset: starting token index, advances by batch*seq each call.
+    // Returns false when corpus is exhausted.
     bool next_batch(uint32_t*  input,
                     uint32_t*  target,
                     int        batch,
                     int        seq,
                     uint64_t&  offset) const;
 };
+
+// Tokenize subcommand — reads .txt files from in_path, writes corpus to out_path.
+void tokenize_dir(const std::string& model_dir,
+                  const std::string& in_path,
+                  const std::string& out_path);
 
 } // namespace io
