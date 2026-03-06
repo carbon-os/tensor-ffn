@@ -100,13 +100,9 @@ __global__ static void k_xavier_init(float* w, int n, float scale, unsigned seed
 void expert_init_weights(ExpertFFN& e, unsigned long seed) {
     int H = e.hidden_size, I = e.intermediate_size;
 
-    // gate/up: Xavier uniform — these project input into intermediate space
-    float scale_gate = sqrtf(6.0f / (float)(H + I));
-
-    // down_proj: zero init — expert starts as a no-op delta
-    // The branch output is expert_delta = gate_act @ down_proj.T
-    // Zero down_proj → zero delta → base model runs unmodified at step 0
-    // The optimizer will grow down_proj from zero as needed
+    // Scale down Xavier initialization by 0.1 to prevent the expert 
+    // from dominating the base model signal at step 0.
+    float scale_gate = sqrtf(6.0f / (float)(H + I)) * 0.1f; 
 
     for (int l = 0; l < e.num_layers; ++l) {
         auto& el = e.layers[l];
@@ -114,15 +110,14 @@ void expert_init_weights(ExpertFFN& e, unsigned long seed) {
         size_t d  = (size_t)H * I;
         unsigned ls = (unsigned)(seed + l * 3);
 
-        // gate_proj and up_proj: Xavier uniform (unchanged)
+        // Initialize gate and up projections with reduced variance
         k_xavier_init<<<(gu+255)/256, 256>>>(el.gate_proj_fp32, (int)gu, scale_gate, ls);
         k_xavier_init<<<(gu+255)/256, 256>>>(el.up_proj_fp32,   (int)gu, scale_gate, ls+1);
 
-        // down_proj: zero
+        // down_proj: strict zero init so expert is a no-op initially
         backend::device_memset(el.down_proj_fp32, 0, d * sizeof(float));
 
-        // Zero the fp32 master moments too (already done in expert_alloc,
-        // but be explicit since init order matters)
+        // Zero out AdamW moments
         backend::device_memset(el.gate_m1, 0, gu * sizeof(float));
         backend::device_memset(el.gate_m2, 0, gu * sizeof(float));
         backend::device_memset(el.up_m1,   0, gu * sizeof(float));
@@ -130,7 +125,7 @@ void expert_init_weights(ExpertFFN& e, unsigned long seed) {
         backend::device_memset(el.down_m1, 0, d  * sizeof(float));
         backend::device_memset(el.down_m2, 0, d  * sizeof(float));
 
-        // Cast to bf16
+        // Cast master fp32 weights to the bf16 working buffers
         backend::cast_fp32_to_bf16(el.gate_proj_fp32, el.gate_proj, (int)gu);
         backend::cast_fp32_to_bf16(el.up_proj_fp32,   el.up_proj,   (int)gu);
         backend::cast_fp32_to_bf16(el.down_proj_fp32, el.down_proj, (int)d);

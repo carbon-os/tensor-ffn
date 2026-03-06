@@ -1,6 +1,3 @@
-// ============================================================
-// FILE: trainer/include/io/tokenizer.h
-// ============================================================
 #pragma once
 #include <string>
 #include <vector>
@@ -21,8 +18,8 @@ struct Tokenizer {
     void load(const std::string& model_dir);
     std::vector<uint32_t> encode(const std::string& text) const;
     std::string           decode(const std::vector<uint32_t>& ids) const;
-
-    // This was missing in the trainer header:
+    
+    // MOVED INSIDE THE STRUCT:
     uint32_t get_id(const std::string& token) const;
 };
 

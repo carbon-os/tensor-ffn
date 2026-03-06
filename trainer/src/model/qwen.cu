@@ -36,11 +36,15 @@ QwenConfig qwen_config_from_json(const std::string& model_dir) {
     c.head_dim          = c.hidden_size / c.num_heads;
     c.vocab_size        = j.value("vocab_size",        151936);
     c.max_seq_len       = j.value("max_position_embeddings", 131072);
-    c.rms_norm_eps      = j.value("rms_norm_eps",      1e-6f);
-    c.rope_theta        = j.value("rope_theta",        1e6f);
+
+
     c.eos_token_id      = j.value("eos_token_id",      151645);
     c.bos_token_id      = j.value("bos_token_id",      151643);
-    c.tie_embeddings    = j.value("tie_word_embeddings", true);
+
+    c.rms_norm_eps      = j.value("rms_norm_eps",             1e-6f);
+    c.rope_theta        = j.value("rope_theta",               1e6f);
+
+    c.tie_embeddings    = j.value("tie_word_embeddings",      true);
     return c;
 }
 

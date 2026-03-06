@@ -70,6 +70,7 @@ __global__ static void k_l2_sum(const float* g, float* out, int n) {
 float adamw_clip_grads(model::ExpertFFN& e, float max_norm, cudaStream_t s) {
     float global_sq = 0.f;
 
+    // Step 1: Calculate Global Squared Norm across all layers
     for (int l = 0; l < e.num_layers; ++l) {
         auto& el = e.layers[l];
         int gu = e.intermediate_size * e.hidden_size;
@@ -78,30 +79,34 @@ float adamw_clip_grads(model::ExpertFFN& e, float max_norm, cudaStream_t s) {
         float* norm_d;
         cudaMalloc(&norm_d, sizeof(float));
         cudaMemset(norm_d, 0, sizeof(float));
+        
         k_l2_sum<<<1, 256, 0, s>>>(el.gate_grad, norm_d, gu);
         k_l2_sum<<<1, 256, 0, s>>>(el.up_grad,   norm_d, gu);
         k_l2_sum<<<1, 256, 0, s>>>(el.down_grad, norm_d, d);
 
         float layer_sq;
-        cudaMemcpyAsync(&layer_sq, norm_d, sizeof(float),
-                        cudaMemcpyDeviceToHost, s);
+        cudaMemcpyAsync(&layer_sq, norm_d, sizeof(float), cudaMemcpyDeviceToHost, s);
         cudaStreamSynchronize(s);
         cudaFree(norm_d);
-
         global_sq += layer_sq;
-        float layer_norm = sqrtf(layer_sq);
+    }
 
-        if (layer_norm > max_norm) {
-            float scale = max_norm / (layer_norm + 1e-6f);
-            printf("  [clip] layer %2d gnorm=%.4f > max=%.2f, scale=%.6f\n",
-                   l, layer_norm, max_norm, scale);
+    float global_norm = sqrtf(global_sq);
+    
+    // Step 2: Apply Global Scaling if the norm exceeds the threshold
+    if (global_norm > max_norm) {
+        float scale = max_norm / (global_norm + 1e-6f);
+        for (int l = 0; l < e.num_layers; ++l) {
+            auto& el = e.layers[l];
+            int gu = e.intermediate_size * e.hidden_size;
+            int d  = e.hidden_size       * e.intermediate_size;
             backend::scale_fp32(el.gate_grad, scale, gu, s);
             backend::scale_fp32(el.up_grad,   scale, gu, s);
             backend::scale_fp32(el.down_grad, scale, d,  s);
         }
     }
 
-    return sqrtf(global_sq);  // global pre-clip norm for logging
+    return global_norm; 
 }
 
 // ================================================================

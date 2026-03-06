@@ -65,25 +65,23 @@ nvidia-smi --query-gpu=name,compute_cap --format=csv
 
 # Tokenize
 ./build/tensor-ffn tokenize \
-  --model ./qwen2.5-0.5b/ \
+  --model ./qwen2.5-0.5b-instruct/ \
   --in    /root/docs/ \
   --out   ./corpus.bin
 
 # Train
-./build/tensor-ffn train \
-  --model ./qwen2.5-0.5b/ \
-  --data  ./corpus.bin \
-  --out   ./my-expert.bin
+./build/tensor-ffn train --model ./qwen2.5-0.5b-instruct/ --data ./corpus.bin --out ./my-expert.bin --lr 1e-4 --seq 1024 --batch 4
 
   
 
 # Inference comparison
-./build/tensor-ffn inference --model ./qwen2.5-0.5b/ --prompt "func main()"
-./build/tensor-ffn inference --model ./qwen2.5-0.5b/ --expert ./my-expert.bin --prompt "func main()"
+./build/tensor-ffn inference --model ./qwen2.5-0.5b-instruct/ --prompt "func main()"
+./build/tensor-ffn inference --model ./qwen2.5-0.5b-instruct/ --expert ./my-expert.bin --prompt "func main()"
 ```
 
 ## Model Weights
 ```bash
 pip install huggingface_hub
 python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2.5-0.5B', local_dir='./qwen2.5-0.5b/')"
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2.5-0.5B-Instruct', local_dir='./qwen2.5-0.5b-instruct/')"
 ```
