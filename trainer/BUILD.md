@@ -49,10 +49,19 @@ The binary lands at `build/tensor-ffn`.
 
 ## Quick Test
 ```bash
+
+
+export CUDA_LAUNCH_BLOCKING=1
+export CUBLAS_LOGDEST_DBG=stdout
+export CUBLAS_LOGINFO_DBG=1
+export CUDA_LAUNCH_BLOCKING=1
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+nvidia-smi --query-gpu=name,compute_cap --format=csv
+
 # Tokenize
 ./build/tensor-ffn tokenize \
   --model ./qwen2.5-0.5b/ \
-  --in    ./docs/ \
+  --in    /root/docs/ \
   --out   ./corpus.bin
 
 # Train
@@ -60,6 +69,8 @@ The binary lands at `build/tensor-ffn`.
   --model ./qwen2.5-0.5b/ \
   --data  ./corpus.bin \
   --out   ./my-expert.bin
+
+  
 
 # Inference comparison
 ./build/tensor-ffn inference --model ./qwen2.5-0.5b/ --prompt "func main()"

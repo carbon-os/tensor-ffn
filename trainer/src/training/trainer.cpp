@@ -14,13 +14,54 @@
 namespace training {
 
 int trainer_auto_batch(const model::QwenModel& m, int seq_len) {
-    // Attention scratch dominates: B * num_heads * seq * seq * 4 bytes
-    // On A100 80GB: after model (~1GB) and activation buffers (~8GB overhead),
-    // roughly 70GB free. For seq=2048, nh=14:
-    //   per batch: 14 * 2048 * 2048 * 4 = 234MB
-    //   70GB / 234MB ≈ 298 — cap at 8 for safety with all other buffers.
-    (void)m; (void)seq_len;
-    return 8;
+    size_t free_bytes, total_bytes;
+    cudaMemGetInfo(&free_bytes, &total_bytes);
+
+    auto& c = m.cfg;
+
+    // Reserve 1.5GB headroom for model weights + misc
+    size_t reserved = 1536ULL * 1024 * 1024;
+    if (free_bytes <= reserved) return 1;
+    size_t budget = free_bytes - reserved;
+
+    // Per-batch memory cost (bytes):
+    //   attention scratch: nh * seq * seq * 4
+    //   h_states:         (L+1) * seq * H * 2
+    //   ffn_norm_out:      L    * seq * H * 2
+    //   expert_delta:      L    * seq * H * 4
+    //   d_delta + d_xnorm: L   * seq * H * 4 * 2
+    //   d_h_scratch:             seq * H * 4
+    //   logits:                  seq * V * 4 * 2  (logits + dlogits)
+    //   tokens + targets:        seq * 4 * 2
+    size_t S  = (size_t)seq_len;
+    size_t H  = (size_t)c.hidden_size;
+    size_t I  = (size_t)c.intermediate_size;
+    size_t L  = (size_t)c.num_layers;
+    size_t nh = (size_t)c.num_heads;
+    size_t V  = (size_t)c.vocab_size;
+
+    size_t per_batch =
+        nh * S * S * 4                  // attn scratch
+      + (L+1) * S * H * 2              // h_states
+      + L     * S * H * 2              // ffn_norm_out
+      + L     * S * H * 4              // expert_delta
+      + L     * S * H * 4 * 2         // d_delta + d_xnorm
+      +         S * H * 4              // d_h_scratch
+      +         S * V * 4 * 2          // logits + dlogits
+      +         S * 4 * 2              // tokens + targets
+      + L * I * H * 2 * 3             // expert gate/up/act bufs
+      + L * I * H * 4 * 3;            // expert fp32 grad bufs
+
+    int batch = (int)(budget / per_batch);
+    if (batch < 1) batch = 1;
+    if (batch > 8) batch = 8;   // cap — diminishing returns beyond 8
+
+    printf("VRAM budget: %.1fGB free, %.1fGB per batch → batch=%d\n",
+           (double)free_bytes / (1024*1024*1024),
+           (double)per_batch  / (1024*1024*1024),
+           batch);
+
+    return batch;
 }
 
 void trainer_init(TrainContext& ctx, const TrainConfig& cfg) {
